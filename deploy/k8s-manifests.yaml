@@ -1,0 +1,175 @@
+# Kubernetes manifests for Adaptive Concurrency Limiter
+# Apply with: kubectl apply -f k8s-manifests.yaml
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: rate-limiter
+  labels:
+    app.kubernetes.io/name: adaptive-limiter
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: limiter-config
+  namespace: rate-limiter
+data:
+  # Limiter configuration
+  LIMITER_TARGET_LATENCY_MS: "100"
+  LIMITER_MIN_LIMIT: "10"
+  LIMITER_MAX_LIMIT: "500"
+  LIMITER_INITIAL_LIMIT: "50"
+  LIMITER_CONTROL_INTERVAL_S: "2.0"
+  LIMITER_WINDOW_SIZE_S: "30.0"
+  LIMITER_MIN_SAMPLES: "20"
+  LIMITER_MAX_CHANGE_RATE: "0.1"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: adaptive-limiter-demo
+  namespace: rate-limiter
+  labels:
+    app: adaptive-limiter
+    version: v1
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: adaptive-limiter
+  template:
+    metadata:
+      labels:
+        app: adaptive-limiter
+        version: v1
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+        - name: limiter
+          image: adaptive-limiter:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+              name: http
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: limiter-config
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          livenessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - "print('healthy')"
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - "print('ready')"
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 2
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: adaptive-limiter
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: adaptive-limiter
+  namespace: rate-limiter
+  labels:
+    app: adaptive-limiter
+spec:
+  type: ClusterIP
+  selector:
+    app: adaptive-limiter
+  ports:
+    - port: 80
+      targetPort: 8000
+      protocol: TCP
+      name: http
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: adaptive-limiter-pdb
+  namespace: rate-limiter
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: adaptive-limiter
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: adaptive-limiter-hpa
+  namespace: rate-limiter
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: adaptive-limiter-demo
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 10
+          periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Percent
+          value: 50
+          periodSeconds: 60
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+      selectPolicy: Max
